@@ -1,4 +1,4 @@
-// server.js
+
 const express = require("express");
 const http = require("http");
 const path = require("path");
@@ -8,28 +8,39 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Serve static files from public/
-app.use(express.static(path.join(__dirname, "public")));
+// Serve website files from the repository root
+app.use(express.static(__dirname));
+
+// Home page route
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
 
 // In-memory stores for prototype
-const users = {}; // socketId -> { username, avatar, currentRoom, lastSeen }
-const userByName = {}; // username -> socketId (last connected)
-const rooms = { general: [] }; // roomName -> [messages]
-const privateHistory = {}; // "alice|bob" -> messages
+const users = {};
+const userByName = {};
+const rooms = { general: [] };
+const privateHistory = {};
 
 function privateKey(a, b) {
   return [a, b].sort().join("|");
 }
 
+function getOnlineList() {
+  return Object.values(users).map((u) => ({
+    username: u.username,
+    avatar: u.avatar,
+    room: u.currentRoom,
+  }));
+}
+
 io.on("connection", (socket) => {
   console.log("Socket connected:", socket.id);
 
-  socket.on("join", (profile, cb) => {
+  socket.on("join", (profile = {}, cb) => {
     const username =
-      profile && profile.username
-        ? profile.username
-        : "User" + socket.id.slice(0, 4);
-    const avatar = profile && profile.avatar ? profile.avatar : null;
+      profile.username || "User" + socket.id.slice(0, 4);
+    const avatar = profile.avatar || null;
 
     users[socket.id] = {
       username,
@@ -37,12 +48,18 @@ io.on("connection", (socket) => {
       currentRoom: "general",
       lastSeen: null,
     };
-    userByName[username] = socket.id;
 
+    userByName[username] = socket.id;
     socket.join("general");
-    // send current presence and history
+
     io.emit("presence", getOnlineList());
-    cb && cb({ ok: true, history: (rooms["general"] || []).slice(-200) });
+
+    if (typeof cb === "function") {
+      cb({
+        ok: true,
+        history: rooms.general.slice(-200),
+      });
+    }
 
     io.to("general").emit("systemMessage", {
       text: `${username} joined general`,
@@ -50,40 +67,60 @@ io.on("connection", (socket) => {
   });
 
   socket.on("joinRoom", (room, cb) => {
-    const u = users[socket.id];
-    if (!u) return;
-    socket.leave(u.currentRoom);
+    const user = users[socket.id];
+    if (!user || typeof room !== "string" || !room.trim()) return;
+
+    socket.leave(user.currentRoom);
     socket.join(room);
-    u.currentRoom = room;
+    user.currentRoom = room;
+
     rooms[room] = rooms[room] || [];
-    cb && cb({ ok: true, history: rooms[room].slice(-200) });
-    io.to(room).emit("systemMessage", { text: `${u.username} joined ${room}` });
+
+    if (typeof cb === "function") {
+      cb({
+        ok: true,
+        history: rooms[room].slice(-200),
+      });
+    }
+
+    io.to(room).emit("systemMessage", {
+      text: `${user.username} joined ${room}`,
+    });
+
     io.emit("presence", getOnlineList());
   });
 
-  socket.on("roomMessage", (payload, ack) => {
-    const u = users[socket.id];
-    if (!u) return;
-    const room = u.currentRoom || "general";
+  socket.on("roomMessage", (payload = {}, ack) => {
+    const user = users[socket.id];
+    if (!user || typeof payload.text !== "string") return;
+
+    const room = user.currentRoom || "general";
+
     const message = {
       id: Date.now() + "_" + Math.random().toString(36).slice(2),
-      user: u.username,
-      avatar: u.avatar || null,
+      user: user.username,
+      avatar: user.avatar,
       text: payload.text,
       ts: Date.now(),
       room,
     };
+
     rooms[room] = rooms[room] || [];
     rooms[room].push(message);
+
     io.to(room).emit("message", message);
-    ack && ack({ ok: true });
+
+    if (typeof ack === "function") ack({ ok: true });
   });
 
-  socket.on("privateMessage", (payload, ack) => {
-    // payload: { to, text }
+  socket.on("privateMessage", (payload = {}, ack) => {
     const sender = users[socket.id];
-    if (!sender) return;
+
+    if (!sender || typeof payload.to !== "string" ||
+        typeof payload.text !== "string") return;
+
     const key = privateKey(sender.username, payload.to);
+
     const message = {
       id: Date.now() + "_" + Math.random().toString(36).slice(2),
       from: sender.username,
@@ -92,70 +129,87 @@ io.on("connection", (socket) => {
       ts: Date.now(),
       seen: false,
     };
+
     privateHistory[key] = privateHistory[key] || [];
     privateHistory[key].push(message);
 
-    // send to recipient if online
-    const toSock = userByName[payload.to];
-    if (toSock && io.sockets.sockets.get(toSock)) {
-      io.to(toSock).emit("privateMessage", message);
+    const recipientSocket = userByName[payload.to];
+
+    if (recipientSocket && io.sockets.sockets.has(recipientSocket)) {
+      io.to(recipientSocket).emit("privateMessage", message);
     }
-    // echo back to sender
+
     socket.emit("privateMessage", message);
-    ack && ack({ ok: true });
+
+    if (typeof ack === "function") ack({ ok: true });
   });
 
-  socket.on("typing", (data) => {
-    const u = users[socket.id];
-    if (!u) return;
+  socket.on("typing", (data = {}) => {
+    const user = users[socket.id];
+    if (!user) return;
+
     if (data.type === "room") {
-      const room = u.currentRoom || "general";
-      socket.to(room).emit("typing", { user: u.username });
+      socket.to(user.currentRoom || "general").emit("typing", {
+        user: user.username,
+      });
     } else if (data.type === "private" && data.to) {
-      const toSock = userByName[data.to];
-      if (toSock)
-        io.to(toSock).emit("typing", { user: u.username, private: true });
+      const recipientSocket = userByName[data.to];
+
+      if (recipientSocket) {
+        io.to(recipientSocket).emit("typing", {
+          user: user.username,
+          private: true,
+        });
+      }
     }
   });
 
-  socket.on("markSeen", (data) => {
-    // data: { convWith, messageId }
-    const u = users[socket.id];
-    if (!u) return;
-    const key = privateKey(u.username, data.convWith);
-    const arr = privateHistory[key] || [];
-    const msg = arr.find((m) => m.id === data.messageId);
-    if (msg) {
-      msg.seen = true;
-      const senderSock = userByName[msg.from];
-      if (senderSock)
-        io.to(senderSock).emit("messageSeen", {
-          messageId: msg.id,
-          by: u.username,
+  socket.on("markSeen", (data = {}) => {
+    const user = users[socket.id];
+    if (!user || !data.convWith || !data.messageId) return;
+
+    const key = privateKey(user.username, data.convWith);
+    const messages = privateHistory[key] || [];
+    const message = messages.find((item) => item.id === data.messageId);
+
+    if (message) {
+      message.seen = true;
+
+      const senderSocket = userByName[message.from];
+
+      if (senderSocket) {
+        io.to(senderSocket).emit("messageSeen", {
+          messageId: message.id,
+          by: user.username,
         });
+      }
     }
   });
 
   socket.on("disconnect", () => {
-    const info = users[socket.id];
-    if (info) {
-      info.lastSeen = Date.now();
-      delete userByName[info.username];
+    const user = users[socket.id];
+
+    if (user) {
+      user.lastSeen = Date.now();
+
+      if (userByName[user.username] === socket.id) {
+        delete userByName[user.username];
+      }
+
       delete users[socket.id];
+
       io.emit("presence", getOnlineList());
-      io.emit("systemMessage", { text: `${info.username} left` });
-      console.log("Disconnect:", socket.id);
+      io.emit("systemMessage", {
+        text: `${user.username} left`,
+      });
+
+      console.log("Disconnected:", socket.id);
     }
   });
-
-  function getOnlineList() {
-    return Object.values(users).map((u) => ({
-      username: u.username,
-      avatar: u.avatar,
-      room: u.currentRoom,
-    }));
-  }
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log("Server listening on", PORT));
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("Server listening on", PORT);
+});
